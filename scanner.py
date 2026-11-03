@@ -15,7 +15,8 @@ from email.message import EmailMessage
 import yfinance as yf
 
 # ---------- Settings you can change ----------
-WATCHLIST = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "META", "SPY"]
+WATCHLIST = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "META", "SPY",
+             "RDDT", "GOOGL", "INTC", "CRWD", "PANW", "WCBR"]
 LOOKBACK = 20              # days for support / resistance
 MIN_BREAK_VOLUME = 1.2     # breakouts/breakdowns need volume >= this x average
 RSI_PERIOD = 14
