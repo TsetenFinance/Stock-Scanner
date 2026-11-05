@@ -6,13 +6,20 @@ Signals (each fires only on the day it happens):
   - Golden cross / death cross (50-day vs 200-day average)
   - RSI drops below 30 (oversold) or rises above 70 (overbought)
   - New 52-week high / low
+  - Institutional buying footprints (see inst_buying_alerts.py):
+      FOLLOW-THRU day in SPY/QQQ and ACCUMULATION days in watchlist stocks
 Educational tool only, not financial advice.
 """
 import os
 import smtplib
+import sys
+from datetime import datetime
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
+
+import inst_buying_alerts as inst
 
 # ---------- Settings you can change ----------
 WATCHLIST = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "META", "SPY",
@@ -49,12 +56,59 @@ def crossed_below(t_a, t_b, y_a, y_b):
     return t_a < t_b and y_a >= y_b
 
 
-def check(ticker):
+NY = ZoneInfo("America/New_York")
+OPEN_RUN_WINDOW_MIN = 55   # the "open" run only scans within this many minutes after 9:30 ET
+
+# Rough share of a normal day's volume that has traded N minutes after the open
+# (volume is heavy at the open and close, lighter at midday).
+_VOLUME_CURVE = [(0, 0.0), (30, 0.13), (60, 0.22), (120, 0.35), (180, 0.45),
+                 (240, 0.55), (300, 0.66), (360, 0.80), (390, 1.0)]
+
+
+def minutes_since_open(now=None):
+    now = (now or datetime.now(NY)).astimezone(NY)
+    return (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+
+
+def day_fraction_done(now=None):
+    """Share of today's volume that has normally traded so far (1.0 outside market hours)."""
+    m = minutes_since_open(now)
+    if m <= 0 or m >= 390:
+        return 1.0
+    for (m0, f0), (m1, f1) in zip(_VOLUME_CURVE, _VOLUME_CURVE[1:]):
+        if m <= m1:
+            return max(0.03, f0 + (f1 - f0) * (m - m0) / (m1 - m0))
+    return 1.0
+
+
+def run_label(now=None):
+    m = minutes_since_open(now)
+    if m < 0:
+        return "pre-market"
+    if m < 120:
+        return "market open"
+    if m < 390:
+        return "midday"
+    return "after close"
+
+
+def download(ticker):
     df = yf.download(ticker, period="2y", auto_adjust=True, progress=False)
-    if df.empty or len(df) < 260:
-        return [f"{ticker}: not enough data"]
     if hasattr(df.columns, "levels"):
         df.columns = df.columns.get_level_values(0)
+    # During market hours today's volume is partial: project it to a full day
+    # so the volume filters still mean something.
+    frac = day_fraction_done()
+    if not df.empty and frac < 1.0 and df.index[-1].date() == datetime.now(NY).date():
+        df.loc[df.index[-1], "Volume"] = df["Volume"].iloc[-1] / frac
+    return df
+
+
+def check(ticker, spy=None):
+    df = download(ticker)
+    if df.empty or len(df) < 260:
+        return [f"{ticker}: not enough data"]
+    raw = df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
     c = df["Close"]
     df["res"] = c.rolling(LOOKBACK).max().shift(1)
@@ -107,7 +161,28 @@ def check(ticker):
     if crossed_below(close, t["lo52"], y["Close"], y["lo52"]):
         alerts.append(f"52-WEEK LOW  {ticker} closed at ${close:,.2f}, a new 1-year low | {info}")
 
+    # 6. Institutional buying footprint (index tickers are handled in market_check)
+    #    Reclaims are skipped because CROSS UP above already covers them.
+    if ticker not in inst.INDEXES:
+        alerts += inst.scan_ticker(raw, ticker, spy, include_reclaims=False)
+
     return alerts
+
+
+def market_check():
+    """Follow-through day signals plus background context for SPY and QQQ."""
+    signals, context, spy = [], [], None
+    for idx in inst.INDEXES:
+        try:
+            raw = download(idx)[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if idx == "SPY":
+                spy = raw
+            s, ctx = inst.scan_index(raw, idx, include_reclaims=False)
+            signals += s
+            context += ctx
+        except Exception as e:
+            context.append(f"{idx}: market check error {e}")
+    return signals, context, spy
 
 
 def send_email(subject, body):
@@ -124,17 +199,32 @@ def send_email(subject, body):
 
 
 if __name__ == "__main__":
-    all_alerts = []
+    # Two "open" runs are scheduled (summer and winter times); only the one that
+    # lands just after 9:30 New York time actually scans.
+    if os.environ.get("RUN_SLOT") == "open" and not 0 <= minutes_since_open() <= OPEN_RUN_WINDOW_MIN:
+        print(f"Skipping open run: {minutes_since_open():.0f} min from the 9:30 ET open.")
+        sys.exit(0)
+
+    label = run_label()
+    all_alerts, market_context, spy = market_check()
     for tk in WATCHLIST:
         try:
-            all_alerts += check(tk)
+            all_alerts += check(tk, spy)
         except Exception as e:
             all_alerts.append(f"{tk}: error {e}")
 
     print("\n".join(all_alerts) or "No signals today.")
+    print("\n".join(market_context))
 
+    # Market context rides along with real signals but never triggers an email by itself
+    backdrop = ("\n\nMarket backdrop:\n" + "\n".join(market_context)) if market_context else ""
+    note = ""
+    if label in ("market open", "midday"):
+        note = ("\n\nNote: scanned during market hours. Prices are live and volume is projected "
+                "to a full day, so signals can change by the close.")
     footer = "\n\n---\nEducational alerts only, not financial advice."
     if all_alerts:
-        send_email(f"Stock scanner: {len(all_alerts)} signal(s)", "\n\n".join(all_alerts) + footer)
+        send_email(f"Stock scanner ({label}): {len(all_alerts)} signal(s)",
+                   "\n\n".join(all_alerts) + backdrop + note + footer)
     elif SEND_IF_NOTHING:
-        send_email("Stock scanner: no signals today", "Nothing triggered today." + footer)
+        send_email(f"Stock scanner ({label}): no signals", "Nothing triggered." + footer)

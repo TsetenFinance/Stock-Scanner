@@ -1,8 +1,13 @@
 name: Stock scanner
 
+# GitHub schedules use UTC. Edmonton is UTC-6 all year; New York moves its clocks.
 on:
   schedule:
-    - cron: "30 21 * * 1-5"   # 21:30 UTC weekdays = 4:30 pm New York in winter
+    - cron: "40 13 * * 1-5"   # market open in summer (9:40 am New York = 7:40 am Edmonton)
+    - cron: "40 14 * * 1-5"   # market open in winter (9:40 am New York = 8:40 am Edmonton)
+                              #   scanner.py runs only the one that is ~10 min after the open
+    - cron: "0 17 * * 1-5"    # 11:00 am Edmonton (midday)
+    - cron: "30 21 * * 1-5"   # 3:30 pm Edmonton (after the close)
   workflow_dispatch:           # adds a manual "Run workflow" button
 
 jobs:
@@ -13,9 +18,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install yfinance pandas
+      - run: pip install yfinance pandas tzdata
       - run: python scanner.py
         env:
+          RUN_SLOT: ${{ (github.event.schedule == '40 13 * * 1-5' || github.event.schedule == '40 14 * * 1-5') && 'open' || '' }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
